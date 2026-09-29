@@ -1,0 +1,70 @@
+name: uptime-watchdog
+
+# The dead-man's switch for buzzmax.ai, the app, and the app's own schedulers
+# (BM-128). Runs OUTSIDE Vercel on purpose: if Vercel cron or Inngest stops,
+# every monitor inside the app stops with it and says nothing. The app side is
+# GET /api/heartbeat in javinmatsu/buzzmax-app.
+#
+# Fails when any of these is not HTTP 200, or when the client heartbeat's last
+# run is older than 150 minutes (it runs hourly at :50). A failed scheduled run
+# emails "the user who last modified the cron syntax in the workflow file"
+# (GitHub's rule); that email is the alert. See README.md.
+#
+# Each URL gets 3 tries 20s apart, so one slow response does not page anyone.
+# No checkout, no npm, no secrets: a curl job. This repo is PUBLIC so its
+# Actions minutes are free; keepalive.yml stops GitHub disabling it after 60
+# quiet days.
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: uptime-watchdog
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe the site, the app and the heartbeat
+        shell: bash
+        run: |
+          set -uo pipefail
+          fail=0
+
+          probe() {
+            local url="$1" code body
+            for attempt in 1 2 3; do
+              body="$(curl -sS -L --max-time 20 -o /tmp/body -w '%{http_code}' "$url" 2>/tmp/err)" || true
+              code="$body"
+              if [ "$code" = "200" ]; then echo "ok   $url ($code)"; return 0; fi
+              [ "$attempt" -lt 3 ] && sleep 20
+            done
+            echo "::error::$url answered ${code:-no response} after 3 tries $(head -c 200 /tmp/err 2>/dev/null)"
+            return 1
+          }
+
+          probe "https://buzzmax.ai" || fail=1
+          probe "https://app.buzzmax.ai/login" || fail=1
+
+          # The heartbeat answers 503 when stale, so a 200 already means fresh;
+          # the age is checked again here so the log says how stale.
+          if probe "https://app.buzzmax.ai/api/heartbeat"; then
+            age="$(sed -n 's/.*"heartbeatAgeMin":\([0-9][0-9]*\).*/\1/p' /tmp/body)"
+            if [ -z "$age" ] || [ "$age" -gt 150 ]; then
+              echo "::error::client heartbeat last ran ${age:-never} minutes ago (limit 150): Vercel cron may be down"
+              fail=1
+            else
+              echo "ok   client heartbeat ran ${age} minutes ago"
+            fi
+          else
+            echo "::error::client heartbeat is stale or unreachable: $(head -c 200 /tmp/body 2>/dev/null)"
+            fail=1
+          fi
+
+          exit "$fail"
